@@ -289,4 +289,23 @@ struct tcp_info_ {
     uint32_t total_retrans;
 };
 
+// Linux-style interface enumeration structures (32-bit ABI)
+#define IFNAMSIZ_ 16
+
+struct ifconf_ {
+    int32_t ifc_len;    // buffer length in bytes
+    addr_t  buf_addr;   // user pointer to buffer of ifreq_ (avoid name clash with system ifc_buf macro)
+};
+
+// 与 Linux 32-bit ABI 对齐：name 后是一个 16 字节的 union 区域
+// 可作为 sockaddr_（用于 SIOCGIFCONF）或 ifr_ifindex（用于 SIOCGIFINDEX）
+struct ifreq_ {
+    char ifr_name[IFNAMSIZ_];
+    union {
+        // 注意：避免使用名字 "ifr_addr"，它会被系统头文件中的宏替换
+        struct sockaddr_ ifr_sa; // 16 bytes placeholder for address
+        int32_t           ifr_ifindex; // 4 bytes, 共享同一内存
+    } ifr_ifru;
+};
+
 #endif

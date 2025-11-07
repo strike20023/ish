@@ -1,4 +1,5 @@
 #include <fcntl.h>
+#include <errno.h>
 #include <netinet/tcp.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -48,8 +49,18 @@ int_t sys_socket(dword_t domain, dword_t type, dword_t protocol) {
         protocol = IPPROTO_ICMP;
 
     int sock = socket(real_domain, real_type, protocol);
-    if (sock < 0)
-        return errno_map();
+    if (sock < 0) {
+        int mapped = errno_map();
+#ifdef __APPLE__
+        // 在受限 iOS 环境中，AF_INET/SOCK_DGRAM 创建可能因 ENOBUFS 失败。
+        // 为了让 if_nameindex 工作，降级为伪 socket，仅支持后续 ioctl(SIOCGIFCONF/INDEX)。
+        if (mapped == _ENOBUFS && domain == AF_INET_ && (type & SOCKET_TYPE_MASK) == SOCK_DGRAM_) {
+            STRACE(" fallback pseudo-socket for if_nameindex");
+            return sock_fd_create(-1, domain, type, protocol);
+        }
+#endif
+        return mapped;
+    }
 
 #ifdef __APPLE__
     if (domain == AF_INET_ && type == SOCK_DGRAM_) {

@@ -73,6 +73,9 @@ struct fd *realfs_open(struct mount *mount, const char *path, int flags, int mod
 int realfs_close(struct fd *fd) {
     if (fd->dir != NULL)
         closedir(fd->dir);
+    // 支持伪 socket（real_fd < 0）关闭为 no-op，避免 EBADF
+    if (fd->real_fd < 0)
+        return 0;
     int err = close(fd->real_fd);
     if (err < 0)
         return errno_map();
@@ -461,10 +464,134 @@ int realfs_setflags(struct fd *fd, dword_t flags) {
     return 0;
 }
 
+#include "kernel/calls.h"   // for user_get/user_write and ENOBUFS_ mapping
+#include "fs/sock.h"        // for IFNAMSIZ_, struct ifconf_, struct ifreq_
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netinet/in.h>
+
+#ifndef SIOCGIFCONF_
+#define SIOCGIFCONF_ 0x8912
+#endif
+#ifndef SIOCGIFINDEX_
+#define SIOCGIFINDEX_ 0x8933
+#endif
+
 ssize_t realfs_ioctl_size(int cmd) {
     if (cmd == FIONREAD_)
         return sizeof(dword_t);
+    if (cmd == SIOCGIFCONF_)
+        return 0; // variable size: pass user pointer directly
+    if (cmd == SIOCGIFINDEX_)
+        return sizeof(struct ifreq_);
     return -1;
+}
+
+static int write_ifconf_using_getifaddrs(addr_t ifconf_addr) {
+    struct ifaddrs *ifa_list = NULL;
+    int got = getifaddrs(&ifa_list);
+
+    struct ifconf_ ifc = {};
+    if (user_get(ifconf_addr, ifc)) {
+        if (ifa_list) freeifaddrs(ifa_list);
+        return _EFAULT;
+    }
+
+    // 如果 getifaddrs 失败，优雅退回：报告 0 字节并成功返回
+    if (got != 0 || ifa_list == NULL) {
+        ifc.ifc_len = 0;
+        int err = user_put(ifconf_addr, ifc);
+        return err ? _EFAULT : 0;
+    }
+
+    // 聚合去重：每个接口名最多一个条目，并携带 IPv4 地址（若存在）
+    struct entry { char name[IFNAMSIZ_]; uint32_t ipv4; int has_ipv4; };
+    struct entry *entries = NULL;
+    size_t entries_count = 0, entries_cap = 0;
+
+    for (struct ifaddrs *ifa = ifa_list; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_name || !*ifa->ifa_name) continue;
+        // 查找是否已存在
+        size_t idx = entries_count;
+        for (size_t i = 0; i < entries_count; i++) {
+            if (strncmp(entries[i].name, ifa->ifa_name, IFNAMSIZ_) == 0) { idx = i; break; }
+        }
+        if (idx == entries_count) {
+            // 新增条目
+            if (entries_count == entries_cap) {
+                size_t new_cap = entries_cap ? entries_cap * 2 : 16;
+                struct entry *tmp = realloc(entries, new_cap * sizeof(*entries));
+                if (!tmp) { freeifaddrs(ifa_list); free(entries); return _ENOMEM; }
+                entries = tmp; entries_cap = new_cap;
+            }
+            memset(&entries[idx], 0, sizeof(entries[idx]));
+            size_t nlen = strnlen(ifa->ifa_name, IFNAMSIZ_ - 1);
+            memcpy(entries[idx].name, ifa->ifa_name, nlen);
+            entries[idx].name[nlen] = '\0';
+            entries[idx].has_ipv4 = 0;
+            entries_count++;
+        }
+        // 记录 IPv4 地址（优先首个）
+        if (!entries[idx].has_ipv4 && ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_INET) {
+            struct sockaddr_in *sin = (struct sockaddr_in *) ifa->ifa_addr;
+            entries[idx].ipv4 = sin->sin_addr.s_addr; // network byte order
+            entries[idx].has_ipv4 = 1;
+        }
+    }
+
+    size_t need_bytes = entries_count * sizeof(struct ifreq_);
+
+    // If user buffer is NULL or len is 0, just write back required size
+    if (ifc.ifc_len <= 0 || ifc.buf_addr == 0) {
+        ifc.ifc_len = (int32_t)need_bytes;
+        int err = user_put(ifconf_addr, ifc);
+        freeifaddrs(ifa_list);
+        return err ? _EFAULT : 0;
+    }
+
+    // Fill as many entries as fit
+    size_t max_reqs = ifc.ifc_len / sizeof(struct ifreq_);
+    size_t wrote = 0;
+    for (size_t i = 0; i < entries_count && wrote < max_reqs; i++) {
+        struct ifreq_ req = {};
+        size_t nlen = strnlen(entries[i].name, IFNAMSIZ_ - 1);
+        memcpy(req.ifr_name, entries[i].name, nlen);
+        req.ifr_name[nlen] = '\0';
+
+        // 若有 IPv4，填充 16 字节 sockaddr (family + port + addr)
+        if (entries[i].has_ipv4) {
+            req.ifr_ifru.ifr_sa.family = AF_INET_;
+            // data[0..1] = sin_port = 0
+            req.ifr_ifru.ifr_sa.data[0] = 0;
+            req.ifr_ifru.ifr_sa.data[1] = 0;
+            // data[2..5] = sin_addr (network byte order)
+            uint32_t ip = entries[i].ipv4;
+            req.ifr_ifru.ifr_sa.data[2] = (ip >> 24) & 0xff;
+            req.ifr_ifru.ifr_sa.data[3] = (ip >> 16) & 0xff;
+            req.ifr_ifru.ifr_sa.data[4] = (ip >> 8) & 0xff;
+            req.ifr_ifru.ifr_sa.data[5] = ip & 0xff;
+            // 其余字节置零
+        }
+
+        addr_t dst = ifc.buf_addr + wrote * sizeof(struct ifreq_);
+        if (user_write(dst, &req, sizeof(req))) {
+            free(entries);
+            freeifaddrs(ifa_list);
+            return _EFAULT;
+        }
+        wrote++;
+    }
+
+    // Update ifc_len with bytes actually written
+    ifc.ifc_len = (int32_t)(wrote * sizeof(struct ifreq_));
+    int err_put = user_put(ifconf_addr, ifc);
+    free(entries);
+    freeifaddrs(ifa_list);
+    if (err_put) return _EFAULT;
+
+    // 即使被截断也返回成功，让调用者依据 ifc_len 判断是否需要重试
+    // 这与多数 libc 对 SIOCGIFCONF 的期望一致（返回 0，写入实际字节数）
+    return 0;
 }
 
 int realfs_ioctl(struct fd *fd, int cmd, void *arg) {
@@ -477,6 +604,23 @@ int realfs_ioctl(struct fd *fd, int cmd, void *arg) {
                 return errno_map();
             *(dword_t *) arg = nread;
             return 0;
+        case SIOCGIFCONF_:
+            // arg is user pointer (addr_t)
+            return write_ifconf_using_getifaddrs((addr_t)(uintptr_t)arg);
+        case SIOCGIFINDEX_:
+            // arg points to a kernel buffer of sizeof(struct ifreq_)
+            {
+                struct ifreq_ *ifr = (struct ifreq_ *) arg;
+                // 名字必须存在
+                if (ifr->ifr_name[0] == '\0')
+                    return _EINVAL;
+                unsigned idx = if_nametoindex(ifr->ifr_name);
+                if (idx == 0)
+                    return errno_map();
+                // 写入索引到 union 区域（与 Linux ABI 对齐）
+                ifr->ifr_ifru.ifr_ifindex = (int32_t) idx;
+                return 0;
+            }
     }
     return _ENOTTY;
 }
